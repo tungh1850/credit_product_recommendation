@@ -41,3 +41,4 @@ Thumbs.db
 # ── Evaluation output ─────────────────────────────────────────────────────────
 evaluation/results.json
 evaluation/ablation_results.csv
+.claude
