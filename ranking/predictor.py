@@ -78,8 +78,9 @@ class RankingPredictor:
         print(f"[RankingPredictor] Loaded {self.model_type} from {model_path}")
 
         # Pre-load feature arrays
-        uf_path = os.path.join("data", "processed", "user_features.npy")
-        if_path = os.path.join("data", "processed", "item_features.npy")
+        data_dir = os.path.dirname(meta_path)
+        uf_path = os.path.join(data_dir, "user_features.npy")
+        if_path = os.path.join(data_dir, "item_features.npy")
         self.user_features = (
             np.load(uf_path) if os.path.exists(uf_path) and self.user_feat_dim > 0
             else None
@@ -88,6 +89,10 @@ class RankingPredictor:
             np.load(if_path) if os.path.exists(if_path) and self.item_feat_dim > 0
             else None
         )
+        if self.user_features is not None:
+            print(f"[RankingPredictor] Successfully loaded features from {data_dir}")
+        else:
+            print(f"[RankingPredictor] WARNING: Feature arrays not found in {data_dir}!")
 
     @torch.no_grad()
     def score_candidates(

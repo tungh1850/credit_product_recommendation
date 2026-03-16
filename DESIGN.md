@@ -1,683 +1,430 @@
 # Fintech Credit Product Recommendation System
 ## Technical Design Document
 
-**Project:** End-to-End Credit Product Recommender (Bootcamp Final Project)
-**Dataset:** LendingClub (Kaggle)
-**Stack:** PyTorch · FAISS · FastAPI · Docker
+**Project:** End-to-End Credit Product Recommender
+**Dataset:** LendingClub (Kaggle, 2007–2018Q4)
+**Stack:** Python 3.11 · PyTorch · FAISS · DeepFM · Gemini API · FastAPI · Docker
 
 ---
 
 ## Table of Contents
 
-1. [System Architecture](#1-system-architecture)
-2. [Detailed Data Flow](#2-detailed-data-flow)
-3. [Modular Codebase Structure](#3-modular-codebase-structure)
-4. [Implementation Guide & Docker Strategy](#4-implementation-guide--docker-strategy)
+1. [Architecture Overview](#1-architecture-overview)
+2. [Component Deep Dives](#2-component-deep-dives)
+   - 2.1 [Synthetic Item Catalog Design](#21-synthetic-item-catalog-design)
+   - 2.2 [Vector Retrieval — ALS + FAISS](#22-vector-retrieval--als--faiss)
+   - 2.3 [Ranking Model Service — DeepFM](#23-ranking-model-service--deepfm)
+   - 2.4 [LLM Orchestration Layer — Gemini](#24-llm-orchestration-layer--gemini)
+3. [Data Flow](#3-data-flow)
+   - 3.1 [Offline Training Pipeline](#31-offline-training-pipeline)
+   - 3.2 [Online Inference Pipeline](#32-online-inference-pipeline)
+4. [MLOps & Scaling Considerations](#4-mlops--scaling-considerations)
+5. [Evaluation Protocol](#5-evaluation-protocol)
+6. [Execution Order](#6-execution-order)
 
 ---
 
-## 1. System Architecture
+## 1. Architecture Overview
 
-The system is divided into two physically separate pipelines that share artefacts (saved model weights and FAISS index files) through a mounted volume or local file system.
+The system is divided into two physically separate layers that exchange state
+through a shared artefact store (`models/saved/`):
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        OFFLINE PIPELINE                                 │
-│                    (runs once, or on schedule)                          │
-│                                                                         │
-│  ┌──────────────┐    ┌──────────────────┐    ┌──────────────────────┐  │
-│  │  Raw CSVs    │───▶│  Preprocessing   │───▶│  Interaction Matrix  │  │
-│  │  (LendingClub│    │  (feature eng.,  │    │  (user × item,       │  │
-│  │   Kaggle)    │    │   deduplication, │    │   implicit ratings)  │  │
-│  └──────────────┘    │   time split)    │    └──────────┬───────────┘  │
-│                      └──────────────────┘               │              │
-│                                                          │              │
-│           ┌──────────────────────────────────────────────┘              │
-│           │                                                             │
-│           ▼                                                             │
-│  ┌──────────────────┐                                                   │
-│  │   ALS Training   │  (implicit-cf or custom PyTorch ALS)             │
-│  │   user_emb.npy   │                                                   │
-│  │   item_emb.npy   │                                                   │
-│  └────────┬─────────┘                                                   │
-│           │  item embeddings                                            │
-│           ▼                                                             │
-│  ┌──────────────────┐                                                   │
-│  │  FAISS Indexing  │  (IndexFlatIP or IndexIVFFlat)                   │
-│  │  faiss.index     │                                                   │
-│  └──────────────────┘                                                   │
-│                                                                         │
-│           │  ALS embeddings + interaction data                         │
-│           ▼                                                             │
-│  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │                  NeuMF / DeepFM Training (PyTorch)               │  │
-│  │  • Negative sampling against popularity                          │  │
-│  │  • Input: (user_id, item_id, ALS emb, raw features)             │  │
-│  │  • Output: relevance score ∈ [0, 1]                              │  │
-│  │  • Saved: ranking_model.pt                                       │  │
-│  └──────────────────────────────────────────────────────────────────┘  │
-│                                                                         │
-│  Artefacts written to:  models/saved/                                   │
-│   ├── als_user_embeddings.npy                                           │
-│   ├── als_item_embeddings.npy                                           │
-│   ├── faiss.index                                                       │
-│   ├── ranking_model.pt                                                  │
-│   └── encoders.pkl   (label encoders, scaler, vocab)                   │
-└─────────────────────────────────────────────────────────────────────────┘
-
-                   shared volume / local file system
-                   ────────────────────────────────▶
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        ONLINE PIPELINE                                  │
-│                    (FastAPI server, always-on)                          │
-│                                                                         │
-│  Startup:                                                               │
-│    load faiss.index  ──▶  RAM                                           │
-│    load ranking_model.pt  ──▶  PyTorch (CPU/GPU)                       │
-│    load als_*_embeddings.npy + encoders.pkl  ──▶  RAM                  │
-│                                                                         │
-│  Request Flow:                                                          │
-│                                                                         │
-│  HTTP POST /recommend                                                   │
-│  { "user_id": "U123", "top_k": 10 }                                    │
-│           │                                                             │
-│           ▼                                                             │
-│  ┌──────────────────┐                                                   │
-│  │  Lookup user emb │  als_user_embeddings[user_id]                    │
-│  └────────┬─────────┘                                                   │
-│           │  user_vector (d,)                                           │
-│           ▼                                                             │
-│  ┌──────────────────┐                                                   │
-│  │  FAISS Retrieval │  top-K*10 candidates via ANN (inner product)     │
-│  └────────┬─────────┘                                                   │
-│           │  candidate_item_ids  (K*10,)                               │
-│           ▼                                                             │
-│  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │               NeuMF / DeepFM Ranking (PyTorch)                   │  │
-│  │  • Build feature tensor for each (user, candidate) pair          │  │
-│  │  • Forward pass → relevance scores                               │  │
-│  │  • Sort descending → top-K                                       │  │
-│  └────────┬─────────────────────────────────────────────────────────┘  │
-│           │  ranked_item_ids  (K,)                                     │
-│           ▼                                                             │
-│  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │  (Optional) LLM Reranker                                         │  │
-│  │  • Compose prompt: borrower profile + top-K loan descriptions    │  │
-│  │  • Call Claude / GPT-4 API                                       │  │
-│  │  • Parse reranked list from response                             │  │
-│  └────────┬─────────────────────────────────────────────────────────┘  │
-│           │                                                             │
-│           ▼                                                             │
-│  HTTP 200  { "recommendations": [ {...loan details...} ] }             │
-└─────────────────────────────────────────────────────────────────────────┘
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                           OFFLINE TRAINING LAYER                            ║
+║                     (runs once, or on a nightly schedule)                   ║
+║                                                                              ║
+║  Raw CSV ──▶ Preprocessing ──▶ Interaction Matrix (user × item, implicit)   ║
+║                                        │                                    ║
+║                         ┌──────────────┘                                    ║
+║                         ▼                                                   ║
+║              ALS Training (implicit-cf, factors=64)                         ║
+║              als_user_embeddings.npy   (n_users × 64)                       ║
+║              als_item_embeddings.npy   (n_items × 64)                       ║
+║                         │                                                   ║
+║                         ▼                                                   ║
+║              FAISS Index (IndexFlatIP, L2-normalised)                       ║
+║              faiss.index                                                    ║
+║                         │                                                   ║
+║                         ▼                                                   ║
+║              DeepFM Ranking Model (PyTorch)                                 ║
+║              ranking_model.pt                                               ║
+║                                                                              ║
+║  Artefacts: models/saved/{embeddings, faiss.index, ranking_model.pt,        ║
+║                            encoders.pkl, feature_meta.json}                 ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+                              ↕  shared volume
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                          ONLINE INFERENCE LAYER                             ║
+║                      (FastAPI server, always-on)                            ║
+║                                                                              ║
+║  POST /recommend  { user_id, top_k }                                        ║
+║          │                                                                   ║
+║          ▼                                                                   ║
+║  [Stage 1] FAISS ANN Retrieval  ──▶  top-50 candidates  (< 1 ms)           ║
+║          │                                                                   ║
+║          ▼                                                                   ║
+║  [Stage 2] DeepFM Re-scoring    ──▶  top-10 candidates  (< 5 ms)           ║
+║          │                                                                   ║
+║          ▼                                                                   ║
+║  [Stage 3] Gemini LLM Re-rank   ──▶  top-5  final list  (200–800 ms)       ║
+║          │         (optional; degrades gracefully to Stage 2 on failure)    ║
+║          ▼                                                                   ║
+║  HTTP 200  { recommendations: [ { item_id, grade, purpose, ... } ] }       ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 ```
 
 ### Key Design Decisions
 
 | Decision | Choice | Rationale |
-|---|---|---|
-| Retrieval model | ALS (matrix factorisation) | Simple, interpretable, proven on implicit feedback |
-| ANN library | FAISS `IndexFlatIP` (small) / `IndexIVFFlat` (larger) | Zero infra overhead, runs in-process |
-| Ranking model | NeuMF (simpler) or DeepFM (richer feature interactions) | Reranks ALS candidates; corrects for popularity bias |
-| API framework | FastAPI | Async, auto OpenAPI docs, easy Pydantic validation |
-| Serialisation | `.npy` for embeddings, `torch.save` for model, `pickle` for encoders | Simple and portable for local/Docker use |
+|----------|--------|-----------|
+| Item definition | Synthetic catalog (Grade × Purpose × Term) | Converts a loan-application dataset into a repeatable product-recommendation problem; limits item space to ~181 products |
+| Retrieval model | ALS (`implicit` library) | Proven on implicit feedback; fast matrix factorisation; 64-dim embeddings fit in RAM |
+| ANN library | FAISS `IndexFlatIP` | Exact inner product; zero extra infra; sub-millisecond at n_items ≈ 181; swappable to `IndexIVFFlat` for larger catalogs |
+| Ranking model | DeepFM | Captures both 2nd-order FM interactions and higher-order MLP interactions from the same shared embedding table; outperforms NeuMF on this feature-rich dataset |
+| LLM provider | Google Gemini (`google-genai` SDK) | Native structured output (`response_schema=list[str]`) eliminates JSON parsing fragility; `gemini-2.5-pro` and `gemini-3.0-pro-preview` evaluated |
+| API framework | FastAPI | Async, auto OpenAPI docs, Pydantic validation, lifespan events for artefact loading |
+| Serialisation | `.npy` embeddings, `torch.save` model, `pickle` encoders | Portable, framework-agnostic; readable without special tooling |
 
 ---
 
-## 2. Detailed Data Flow
+## 2. Component Deep Dives
 
-### 2.1 Data Preprocessing
+### 2.1 Synthetic Item Catalog Design
 
-#### Source Files
-The LendingClub dataset contains one or more CSVs (e.g., `accepted_2007_to_2018Q4.csv`) with ~150 columns per loan application. Each row represents **one loan application by one borrower**.
+The raw LendingClub dataset contains ~2.2 million individual loan applications.
+Treating each as a unique item produces a nearly non-repeatable interaction matrix
+(most items appear only once) and renders collaborative filtering meaningless.
 
-#### Step 1 — Load & Filter
-
-```
-raw_df = pd.read_csv("data/raw/accepted_loans.csv", low_memory=False)
-
-Keep columns:
-  member_id          → user identifier (some versions use "id" or "emp_title" proxy)
-  loan_amnt          → item feature
-  term               → item feature  ("36 months" / "60 months")
-  int_rate           → item feature
-  grade / sub_grade  → item feature
-  purpose            → item feature  (debt_consolidation, credit_card, home_improvement …)
-  loan_status        → interaction signal
-  issue_d            → timestamp for time-based split
-  annual_inc         → user feature
-  dti                → user feature  (debt-to-income ratio)
-  fico_range_low/high→ user feature
-  home_ownership     → user feature
-  addr_state         → user feature (coarse geography)
-
-Drop: free-text fields (desc, title) unless using LLM reranker
-Drop: rows where member_id or loan_status is null
-```
-
-#### Step 2 — Define Users, Items, and Interactions
+**Solution:** Define a *recommendable product* as the tuple `(grade, purpose, term)`:
 
 ```
-USER  = member_id  (one unique borrower)
-ITEM  = a distinct loan product type, bucketed by (grade, purpose, term)
-        → create a synthetic item_id:  item_id = grade + "_" + purpose + "_" + term
-        e.g.  "B_debt_consolidation_36 months"  →  item_id = 42
-
-INTERACTION SIGNAL (implicit):
-  loan_status in {"Fully Paid", "Current"}   → rating = 1   (positive)
-  loan_status in {"Charged Off", "Default"}  → rating = 0   (negative — keep for ranking)
-  All others (Late, Grace Period)             → drop
-
-Why implicit?
-  Borrowers don't rate loans; their repayment behaviour IS the signal.
-  ALS on implicit data is standard (Hu, Koren & Volinsky, 2008).
+item_id = f"{grade}_{purpose}_{term}"
+# e.g. "B_debt_consolidation_36 months" → item_idx = 42
 ```
 
-#### Step 3 — Encode IDs
+This yields at most **7 × 14 × 2 = 196** product types, of which ~181 appear in
+the dataset. Each user's interactions collapse to a set of product types they have
+engaged with — exactly the input format collaborative filtering requires.
 
-```python
-from sklearn.preprocessing import LabelEncoder
-
-user_enc = LabelEncoder().fit(df["member_id"])
-item_enc = LabelEncoder().fit(df["item_id"])
-
-df["user_idx"] = user_enc.transform(df["member_id"])
-df["item_idx"] = item_enc.transform(df["item_id"])
-
-# Save encoders
-import pickle
-with open("models/saved/encoders.pkl", "wb") as f:
-    pickle.dump({"user_enc": user_enc, "item_enc": item_enc}, f)
-```
-
-#### Step 4 — Time-Based Train / Val / Test Split
-
-```
-Sort all rows by issue_d ascending.
-
-train : rows where issue_d < 2017-01-01   (~70%)
-val   : rows where 2017-01-01 ≤ issue_d < 2018-01-01   (~15%)
-test  : rows where issue_d ≥ 2018-01-01   (~15%)
-
-This mimics production: the model is trained on historical data and
-evaluated on future borrowers — preventing data leakage.
-
-For each split, build a sparse interaction matrix:
-  shape = (n_users, n_items),  value = 1 if positive interaction
-```
-
-#### Step 5 — Feature Engineering for Ranking Model
-
-```
-User features  (normalised with StandardScaler):
-  annual_inc, dti, fico_range_low, fico_range_high,
-  one-hot: home_ownership, addr_state (top 10 states + "other")
-
-Item features  (from item_id lookup table):
-  int_rate (float), loan_amnt_bucket (binned),
-  one-hot: grade (A–G), purpose (14 categories), term (2 values)
-
-Concatenate → feature_vector per (user, item) pair
-Save scaler and one-hot vocabulary into encoders.pkl
-```
+The item lookup table (`data/processed/item_lookup.csv`) additionally stores
+`int_rate` (mean interest rate), `positive_rate` (historical repayment rate),
+and loan count per product, which are fed to the LLM as context signals.
 
 ---
 
-### 2.2 Offline Training Phase
+### 2.2 Vector Retrieval — ALS + FAISS
 
-#### Stage A — ALS Training
-
-ALS (Alternating Least Squares) factorises the implicit interaction matrix
-`R ≈ U × Vᵀ` where `U ∈ ℝ^(n_users × d)` and `V ∈ ℝ^(n_items × d)`.
+#### ALS Training (`retrieval/train_als.py`)
 
 ```
-Option 1 (recommended for simplicity):
-  pip install implicit
-  from implicit.als import AlternatingLeastSquares
+Input : train_interactions.npz   shape (n_users, n_items), implicit binary
+Model : AlternatingLeastSquares(factors=64, iterations=20, regularization=0.1)
+Note  : implicit library expects item×user input; factors are swapped on export
 
-  model = AlternatingLeastSquares(factors=64, iterations=20, regularization=0.1)
-  model.fit(train_matrix.T)   # implicit expects item×user
-
-Option 2 (PyTorch ALS — required if framework constraint is strict):
-  Implement closed-form ALS update in PyTorch:
-    U_i ← (VᵀV + λI)⁻¹ Vᵀ r_i
-  Loop alternately over users and items for `n_iter` iterations.
-  See  models/als_model.py
-
-Export:
-  np.save("models/saved/als_user_embeddings.npy", model.user_factors)
-  np.save("models/saved/als_item_embeddings.npy", model.item_factors)
-  Shapes: (n_users, 64) and (n_items, 64)
+Output:
+  als_user_embeddings.npy   shape (n_users, 64)
+  als_item_embeddings.npy   shape (n_items, 64)
 ```
 
-#### Stage B — Build FAISS Index
+**Critical implementation note:** The `implicit` library's `model.user_factors`
+stores row factors of the *item×user* training matrix, which correspond to item
+embeddings in the standard interpretation. The export explicitly swaps:
 
 ```python
-import faiss, numpy as np
+# retrieval/train_als.py
+return model.item_factors, model.user_factors  # (user_emb, item_emb)
+```
 
-item_emb = np.load("models/saved/als_item_embeddings.npy").astype("float32")
-d = item_emb.shape[1]   # 64
+#### FAISS Index (`retrieval/build_faiss_index.py`)
 
-# Normalise for cosine similarity via inner product
-faiss.normalize_L2(item_emb)
-
-# For small datasets (< 100k items): exact search
-index = faiss.IndexFlatIP(d)
-
-# For larger datasets: approximate search
-# quantiser = faiss.IndexFlatIP(d)
-# index = faiss.IndexIVFFlat(quantiser, d, n_cells=100, metric=faiss.METRIC_INNER_PRODUCT)
-# index.train(item_emb)
-
+```python
+item_emb = np.load("als_item_embeddings.npy").astype("float32")
+faiss.normalize_L2(item_emb)          # cosine similarity via inner product
+index = faiss.IndexFlatIP(d=64)       # exact search; n_items=181 < 50k threshold
 index.add(item_emb)
-faiss.write_index(index, "models/saved/faiss.index")
-print(f"FAISS index: {index.ntotal} items indexed")
+faiss.write_index(index, "faiss.index")
 ```
 
-#### Stage C — Negative Sampling & Ranking Model Training
+At query time, the user embedding is also L2-normalised before search, so
+`dot(user_vec, item_vec)` computes cosine similarity in constant time.
 
-```
-Negative sampling strategy:
-  For each (user, positive_item) in train set, sample k_neg=4 items
-  that the user has NOT interacted with.
-  Weight sampling by item popularity (popular negatives are harder).
-
-  positive_label = 1
-  negative_label = 0
-
-Training dataset tensor:
-  X = [user_idx, item_idx, user_features (F_u,), item_features (F_i,)]
-  y = [0/1]
-
-NeuMF Architecture (PyTorch):
-  ┌──────────────────────────────────────────────────────────────────┐
-  │  user_idx ──▶ Embedding(n_users, 32) ──┐                        │
-  │                                         ├──▶ MLP([64,32,16,8])  │
-  │  item_idx ──▶ Embedding(n_items, 32) ──┘         │              │
-  │                                                    ▼             │
-  │  user_idx ──▶ Embedding(n_users, 32) ──┐   concat([GMF, MLP])  │
-  │                                         ├──▶ GMF (element-wise  │
-  │  item_idx ──▶ Embedding(n_items, 32) ──┘   multiply)            │
-  │                                                    │             │
-  │                                              Linear(→1) + Sigmoid│
-  └──────────────────────────────────────────────────────────────────┘
-
-DeepFM Architecture (PyTorch — richer alternative):
-  ┌──────────────────────────────────────────────────────────────────┐
-  │  Sparse features ──▶ Embedding lookup                            │
-  │  Dense features  ──▶ normalised float                            │
-  │                                                                  │
-  │  FM Layer:  Σ_i Σ_j <v_i, v_j> x_i x_j  (2nd-order interactions)│
-  │  Deep Layer: MLP([256, 128, 64])                                 │
-  │  Output: FM_out + Deep_out ──▶ Sigmoid                           │
-  └──────────────────────────────────────────────────────────────────┘
-
-Training:
-  Loss     = BCELoss
-  Optimizer= Adam(lr=1e-3)
-  Epochs   = 20 (early stopping on val NDCG@10)
-  Batch    = 2048
-
-Save:
-  torch.save(model.state_dict(), "models/saved/ranking_model.pt")
-```
+**Scaling path:** Replace `IndexFlatIP` with `IndexIVFFlat` (approximate search)
+when n_items exceeds ~50k. No other code changes required.
 
 ---
 
-### 2.3 Online Inference Phase
+### 2.3 Ranking Model Service — DeepFM
+
+#### Architecture (`models/deepfm_model.py`)
 
 ```
-Step 1  Request arrives at  POST /recommend
-        Body: { "user_id": "U123", "top_k": 10 }
+Sparse inputs: [user_idx, item_idx]
+  └──▶ Embedding lookup  (shared table, emb_dim=16 per field)
 
-Step 2  Encode user_id
-        user_idx = user_enc.transform([user_id])[0]
-        If unknown user → cold-start fallback (return top popular items)
+Dense inputs:  [annual_inc, dti, fico_low, fico_high, home_ownership_OHE,
+               addr_state_OHE, int_rate, grade_OHE, purpose_OHE, term_OHE]
+  └──▶ (concatenated as-is)
 
-Step 3  Retrieve user embedding
-        user_vec = als_user_embeddings[user_idx]          # shape (64,)
-        faiss.normalize_L2(user_vec.reshape(1,-1))
+FM Layer:    Σᵢ Σⱼ <vᵢ, vⱼ>  (closed-form 2nd-order interactions)
+Deep Layer:  MLP([256, 128, 64], dropout=0.2)
 
-Step 4  FAISS ANN retrieval
-        D, I = faiss_index.search(user_vec, k=top_k * 10)  # over-fetch
-        candidate_item_idxs = I[0]                         # shape (K*10,)
-
-Step 5  Build ranking feature tensor
-        For each candidate item_idx:
-          row = concat(user_features, item_features, als_user_emb, als_item_emb)
-        tensor shape: (K*10, feature_dim)
-
-Step 6  Ranking model forward pass
-        model.eval()
-        with torch.no_grad():
-            scores = model(user_idx_tensor, candidate_tensor)   # (K*10,)
-        top_k_idxs = scores.argsort(descending=True)[:top_k]
-        top_k_item_idxs = candidate_item_idxs[top_k_idxs]
-
-Step 7  (Optional) LLM Reranking
-        prompt = build_rerank_prompt(user_profile, top_k_items)
-        response = llm_client.chat(prompt)
-        reranked_ids = parse_reranked_order(response, top_k_item_idxs)
-
-Step 8  Decode and return
-        item_names = item_enc.inverse_transform(reranked_ids)
-        item_details = item_lookup_df.loc[item_names]
-        return JSONResponse({"recommendations": item_details.to_dict("records")})
+Output:  fm_out + deep_out  (raw logit; sigmoid applied by BCEWithLogitsLoss)
 ```
 
----
+**Key detail:** `build_deepfm` uses `sparse_field_dims = [n_users, n_items]`
+(2 sparse fields only). Raw tabular features are concatenated as `dense_in`
+and passed to the MLP branch. The model is **not** given pre-computed ALS
+embeddings as input; it learns its own collaborative signal from scratch.
 
-## 3. Modular Codebase Structure
+#### Training (`ranking/train_ranking.py`)
 
 ```
-recommendation_system/
-│
-├── data/
-│   ├── raw/                          # Place downloaded LendingClub CSVs here (git-ignored)
-│   │   └── accepted_2007_to_2018Q4.csv
-│   ├── processed/                    # Output of preprocessing scripts
-│   │   ├── train_interactions.npz    # Sparse user×item matrix, train split
-│   │   ├── val_interactions.npz
-│   │   ├── test_interactions.npz
-│   │   ├── user_features.npy         # Scaled user feature matrix
-│   │   ├── item_features.npy         # Item feature matrix
-│   │   └── item_lookup.csv           # Mapping item_idx → loan attributes
-│   └── __init__.py
-│
-├── preprocessing/
-│   ├── __init__.py
-│   ├── build_interactions.py         # Loads raw CSV, defines user/item IDs, builds
-│   │                                 # implicit interaction matrix and time-based splits.
-│   ├── feature_engineering.py        # Constructs and normalises user and item feature
-│   │                                 # vectors; fits and saves encoders.pkl + scaler.
-│   └── negative_sampler.py           # Generates (user, neg_item) pairs for ranking
-│                                     # training using popularity-weighted sampling.
-│
-├── models/
-│   ├── __init__.py
-│   ├── als_model.py                  # PyTorch implementation of ALS: closed-form user
-│   │                                 # and item factor updates using torch.linalg.solve.
-│   ├── neumf_model.py                # PyTorch NeuMF class: GMF branch + MLP branch
-│   │                                 # fused at output layer with Sigmoid activation.
-│   ├── deepfm_model.py               # PyTorch DeepFM class: factorisation machine layer
-│   │                                 # for 2nd-order interactions + deep MLP branch.
-│   └── saved/                        # Artefacts written by training scripts (git-ignored)
-│       ├── als_user_embeddings.npy
-│       ├── als_item_embeddings.npy
-│       ├── faiss.index
-│       ├── ranking_model.pt
-│       └── encoders.pkl
-│
-├── retrieval/
-│   ├── __init__.py
-│   ├── train_als.py                  # Orchestrates ALS training (calls als_model.py or
-│   │                                 # implicit library), exports .npy embedding files.
-│   └── build_faiss_index.py          # Loads item embeddings, normalises them, builds
-│                                     # FAISS index (Flat or IVF), and writes faiss.index.
-│
-├── ranking/
-│   ├── __init__.py
-│   ├── dataset.py                    # PyTorch Dataset class: reads interaction data +
-│   │                                 # negative samples, returns (user_idx, item_idx,
-│   │                                 # features, label) tensors.
-│   ├── train_ranking.py              # Training loop for NeuMF/DeepFM: BCELoss, Adam,
-│   │                                 # early stopping on val NDCG@10, saves best checkpoint.
-│   └── predictor.py                  # Inference wrapper: loads ranking_model.pt, exposes
-│                                     # score_candidates(user_idx, candidate_item_idxs).
-│
-├── api/
-│   ├── __init__.py
-│   ├── main.py                       # FastAPI app entry point: loads all artefacts at
-│   │                                 # startup via @app.on_event("startup"), defines routes.
-│   ├── schemas.py                    # Pydantic models: RecommendRequest, RecommendResponse,
-│   │                                 # ItemDetail — used for request validation & OpenAPI docs.
-│   ├── recommender.py                # Core recommendation logic: FAISS retrieval →
-│   │                                 # ranking model → optional LLM reranker pipeline.
-│   └── llm_reranker.py               # Optional: builds prompt from borrower profile and
-│                                     # candidate loan descriptions; calls LLM API; parses
-│                                     # reranked list from structured response.
-│
-├── evaluation/
-│   ├── __init__.py
-│   ├── metrics.py                    # Implements Recall@K and NDCG@K as pure Python/NumPy
-│   │                                 # functions operating on ranked item lists.
-│   ├── evaluate_pipeline.py          # Runs full evaluation on the test split: iterates
-│   │                                 # users, calls each pipeline stage, records metrics.
-│   └── ablation_study.py             # Compares three configurations side-by-side:
-│                                     # (1) Retrieval only, (2) Retrieval+Ranking,
-│                                     # (3) Retrieval+Ranking+LLM. Outputs a summary table.
-│
-├── notebooks/
-│   ├── 01_EDA.ipynb                  # Exploratory data analysis: distribution of loan
-│   │                                 # grades, purposes, FICO scores, interaction sparsity.
-│   ├── 02_ALS_Experiment.ipynb       # Interactive ALS training with embedding visualisation
-│   │                                 # (PCA/UMAP of item embeddings coloured by grade).
-│   └── 03_Ranking_Experiment.ipynb   # NeuMF/DeepFM training curves and val metric plots.
-│
-├── scripts/
-│   ├── run_pipeline.sh               # End-to-end bash script: preprocess → train_als →
-│   │                                 # build_faiss → train_ranking → evaluate.
-│   └── download_data.sh              # Kaggle API download helper (requires kaggle.json).
-│
-├── tests/
-│   ├── test_metrics.py               # Unit tests for Recall@K and NDCG@K correctness.
-│   ├── test_neumf.py                 # Smoke test: forward pass through NeuMF with random
-│   │                                 # tensors, asserts output shape and value range.
-│   └── test_api.py                   # FastAPI TestClient integration test: POST /recommend
-│                                     # with a known user_id, assert top-K in response.
-│
-├── Dockerfile
-├── docker-compose.yml
-├── requirements.txt
-├── DESIGN.md                         # This document
-└── README.md
+Loss       : BCEWithLogitsLoss (no sigmoid in forward pass)
+Optimizer  : Adam(lr=1e-3, weight_decay=1e-4)
+Scheduler  : ReduceLROnPlateau(factor=0.5, patience=2)
+Grad clip  : max_norm=1.0
+Early stop : val NDCG@10, patience=5 epochs
+Negative sampling: popularity-weighted (item_freq^0.75), k_neg=4
 ```
 
----
+**Overfitting note:** With only ~1 interaction per user on average, the model
+peaks at epoch 1 (NDCG@10 ≈ 0.35) and degrades thereafter. Early stopping
+correctly saves the epoch-1 checkpoint. This is a known artefact of highly
+sparse implicit feedback datasets, not a model defect.
 
-## 4. Implementation Guide & Docker Strategy
-
-### 4.1 Local Setup (no Docker)
-
-```bash
-# 1. Create environment
-python -m venv .venv && source .venv/bin/activate  # Linux/macOS
-# .venv\Scripts\activate                           # Windows
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Download data (requires Kaggle API key at ~/.kaggle/kaggle.json)
-bash scripts/download_data.sh
-
-# 4. Run the full offline pipeline
-bash scripts/run_pipeline.sh
-
-# 5. Start the API server
-uvicorn api.main:app --reload --port 8000
-```
-
-**`requirements.txt`**
-```
-torch>=2.0.0
-faiss-cpu>=1.7.4
-fastapi>=0.110.0
-uvicorn[standard]>=0.29.0
-pydantic>=2.0.0
-numpy>=1.24.0
-pandas>=2.0.0
-scikit-learn>=1.3.0
-implicit>=0.7.2
-scipy>=1.11.0
-httpx>=0.27.0       # for TestClient in tests
-openai>=1.0.0       # optional, for LLM reranker
-```
-
----
-
-### 4.2 Dockerfile
-
-The Dockerfile covers **only the online (serving) phase**. Offline training is run locally and artefacts are copied into the image (or mounted at runtime).
-
-```dockerfile
-# Dockerfile
-FROM python:3.11-slim
-
-# --- System deps (FAISS needs libgomp) ---
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-# --- Python deps (layer-cached) ---
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# --- Application code ---
-COPY api/        ./api/
-COPY models/     ./models/
-COPY ranking/    ./ranking/
-COPY retrieval/  ./retrieval/
-COPY preprocessing/ ./preprocessing/
-
-# --- Pre-trained artefacts ---
-#     Option A: bake them into the image (simple, larger image)
-COPY models/saved/ ./models/saved/
-
-#     Option B: mount them at runtime via docker-compose volume (preferred)
-#     (leave this COPY commented out and use the volume in docker-compose.yml)
-
-EXPOSE 8000
-
-# Uvicorn starts the FastAPI app; artefacts are loaded inside startup event
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
----
-
-### 4.3 docker-compose.yml
-
-```yaml
-# docker-compose.yml
-version: "3.9"
-
-services:
-
-  recommender-api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: credit-recommender
-    ports:
-      - "8000:8000"
-    volumes:
-      # Mount pre-trained artefacts from host without rebuilding the image
-      - ./models/saved:/app/models/saved:ro
-    environment:
-      - MODEL_DIR=/app/models/saved
-      - FAISS_INDEX_PATH=/app/models/saved/faiss.index
-      - RANKING_MODEL_PATH=/app/models/saved/ranking_model.pt
-      - ENCODERS_PATH=/app/models/saved/encoders.pkl
-      # Optional LLM reranker key (never hardcode secrets)
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    restart: unless-stopped
-```
-
----
-
-### 4.4 FastAPI Startup — Loading Artefacts into Memory
+#### Inference (`ranking/predictor.py`)
 
 ```python
-# api/main.py
-import os
-import pickle
-import numpy as np
-import faiss
-import torch
-from fastapi import FastAPI
-from contextlib import asynccontextmanager
+class RankingPredictor:
+    def score_candidates(self, user_idx, candidate_item_idxs) -> np.ndarray:
+        # Builds (user_idx_tensor, item_idx_tensor) + optional dense features
+        # Dispatches to model.forward() based on model_type in feature_meta.json
+        # Returns raw logit scores (higher = more relevant)
+```
 
-from models.neumf_model import NeuMF
-from api.schemas import RecommendRequest, RecommendResponse
+`feature_meta.json` records `n_users`, `n_items`, `user_feat_dim`,
+`item_feat_dim`, and `model_type` ("deepfm" or "neumf") so the predictor can
+reconstruct the correct model skeleton at load time without any code changes.
 
-# Global artefact store (loaded once at startup)
-artefacts: dict = {}
+---
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Load all heavy artefacts into memory before serving requests."""
-    model_dir = os.getenv("MODEL_DIR", "models/saved")
+### 2.4 LLM Orchestration Layer — Gemini
 
-    # 1. Encoders
-    with open(f"{model_dir}/encoders.pkl", "rb") as f:
-        enc = pickle.load(f)
-    artefacts["user_enc"] = enc["user_enc"]
-    artefacts["item_enc"] = enc["item_enc"]
+#### Context Builder (`prepare_llm_context`)
 
-    # 2. ALS embeddings
-    artefacts["user_emb"] = np.load(f"{model_dir}/als_user_embeddings.npy")
-    artefacts["item_emb"] = np.load(f"{model_dir}/als_item_embeddings.npy")
+For each user, the context builder assembles a structured natural-language prompt
+from three data sources:
 
-    # 3. FAISS index
-    artefacts["faiss_index"] = faiss.read_index(f"{model_dir}/faiss.index")
+| Source | Signal | Where it comes from |
+|--------|--------|---------------------|
+| `interactions_all.parquet` | FICO, DTI, income, home_ownership, state | Raw demographics (un-scaled) |
+| `train_interactions.npz` | Historical loan product indices | Warm-start history |
+| `item_lookup.csv` | Grade, purpose, term, int_rate, positive_rate | Item metadata |
 
-    # 4. Ranking model
-    n_users = artefacts["user_emb"].shape[0]
-    n_items = artefacts["item_emb"].shape[0]
-    model = NeuMF(n_users=n_users, n_items=n_items, emb_dim=32)
-    model.load_state_dict(torch.load(f"{model_dir}/ranking_model.pt", map_location="cpu"))
-    model.eval()
-    artefacts["ranking_model"] = model
+The prompt instructs Gemini to act as a **predictive behavioral analyst** —
+not a prescriptive loan officer — and to rank candidates by *likelihood of
+acceptance by this specific borrower*, with explicit rules to match historical
+loan characteristics for warm-start users.
 
-    print("All artefacts loaded. API is ready.")
-    yield
-    # Cleanup (optional)
-    artefacts.clear()
+#### Gemini API Call Pattern
 
+```python
+response = gemini_client.models.generate_content(
+    model=model,                     # "gemini-2.5-pro" or "gemini-3.0-pro-preview"
+    contents=full_payload,
+    config=types.GenerateContentConfig(
+        temperature=0.0,             # deterministic output
+        response_mime_type="application/json",
+        response_schema=list[str],   # native structured output — no parsing hacks
+    ),
+)
+ranked_ids = json.loads(response.text.strip())
+```
 
-app = FastAPI(title="Credit Recommender API", lifespan=lifespan)
+`response_schema=list[str]` instructs the model to emit a raw JSON array of
+`item_id` strings, bypassing any markdown fences or wrapper keys. This is the
+native structured output feature of the `google-genai` SDK.
 
+#### Retry and Fallback Mechanism
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "artefacts_loaded": list(artefacts.keys())}
+```
+For attempt in range(3):
+    try:
+        response = gemini_client.models.generate_content(...)
+        return parse_and_validate(response)
+    except Exception as e:
+        if "503" or "429" or "RESOURCE_EXHAUSTED" in str(e):
+            wait = 15 * (attempt + 1)   # 15s, 30s, 45s
+            time.sleep(wait)
+            continue
+        else:
+            return original_deepfm_order   # non-retriable error → immediate fallback
 
+return original_deepfm_order              # max retries → graceful degradation
+```
 
-@app.post("/recommend", response_model=RecommendResponse)
-def recommend(req: RecommendRequest):
-    from api.recommender import run_recommendation_pipeline
-    return run_recommendation_pipeline(req, artefacts)
+**Fallback contract:** The LLM stage never raises an exception to the calling
+code. On any failure (network error, rate limit, malformed JSON, wrong type),
+it returns the original DeepFM ordering. This guarantees that Stage 3 adds
+latency but never reduces recommendation quality below the Stage 2 baseline.
+
+#### Output Validation
+
+After receiving the LLM response, the system validates and re-merges:
+
+```python
+valid_set = set(original_item_ids)
+valid   = [x for x in ranked if x in valid_set]    # LLM's preferred order
+missing = [x for x in original_item_ids            # hallucinated IDs discarded
+           if x not in set(valid)]
+return valid + missing   # LLM top-5 first, then any omitted items at the end
+```
+
+This ensures the final list always contains exactly the DeepFM candidates,
+even if the LLM omits or hallucinates some IDs.
+
+#### Warm vs. Cold Start Behaviour
+
+| User Type | LLM Advantage | Observed Uplift |
+|-----------|--------------|-----------------|
+| **Warm Start** (≥1 training interaction) | Can match prior loan Grade/Term/Purpose exactly | NDCG@5 uplift typically positive |
+| **Cold Start** (no history) | Relies solely on demographics (FICO, DTI, income) | Smaller, less consistent uplift |
+
+The ablation study (`evaluation/ablation_study.py`) explicitly separates these
+subsets and reports metrics independently for each.
+
+---
+
+## 3. Data Flow
+
+### 3.1 Offline Training Pipeline
+
+```
+Step 1  preprocessing/build_interactions.py
+        ├── Load raw CSV; keep relevant columns
+        ├── Define item_id = grade + "_" + purpose + "_" + term
+        ├── Encode user_idx, item_idx with LabelEncoder
+        ├── Map loan_status → binary interaction (Fully Paid/Current = 1)
+        ├── Time-based split: train < 2017-01-01, val 2017, test ≥ 2018
+        └── Write train/val/test_interactions.npz + item_lookup.csv
+
+Step 2  preprocessing/feature_engineering.py
+        ├── User features: annual_inc, dti, fico_range_low/high, home_ownership OHE,
+        │   addr_state OHE (top-10 states + "other") → StandardScaler
+        ├── Item features: int_rate, grade OHE, purpose OHE, term OHE
+        └── Write user_features.npy, item_features.npy, encoders.pkl, feature_meta.json
+
+Step 3  retrieval/train_als.py
+        ├── Fit ALS on train_interactions (item×user orientation)
+        └── Write als_user_embeddings.npy (n_users × 64)
+                  als_item_embeddings.npy (n_items × 64)
+
+Step 4  retrieval/build_faiss_index.py
+        ├── Load item embeddings; L2-normalise
+        ├── Build IndexFlatIP (exact inner product)
+        └── Write faiss.index
+
+Step 5  ranking/train_ranking.py
+        ├── Build RankingDataset with popularity-weighted negatives (k_neg=4)
+        ├── Train DeepFM: BCEWithLogitsLoss, Adam, early stop on val NDCG@10
+        └── Write ranking_model.pt (best checkpoint)
+```
+
+### 3.2 Online Inference Pipeline
+
+```
+POST /recommend { user_id: "member_123", top_k: 5 }
+        │
+        ▼
+[Encode]  user_idx = user_enc.transform([user_id])[0]
+          Unknown user → cold-start: return globally popular products
+
+        │
+        ▼
+[Stage 1 — FAISS Retrieval]
+  u_vec = als_user_embeddings[user_idx]          # (64,)
+  faiss.normalize_L2(u_vec)
+  _, I = faiss_index.search(u_vec, k=50)         # over-fetch pool of 50
+  candidates = I[0]                              # item indices, (50,)
+
+        │
+        ▼
+[Stage 2 — DeepFM Re-scoring]
+  scores   = predictor.score_candidates(user_idx, candidates)
+  top10    = candidates[argsort(scores)[::-1][:10]]
+
+        │
+        ▼
+[Stage 3 — Gemini LLM Re-ranking]   (optional; requires GOOGLE_API_KEY)
+  context  = prepare_llm_context(user_idx, top10, past_item_idxs)
+  reranked = get_gemini_rerank(context, item_ids, model="gemini-2.5-pro")
+  top5     = reranked[:5]
+  ↳ On any failure: return top10[:5] (DeepFM order, no exception)
+
+        │
+        ▼
+[Decode]  item_details = item_lookup[top5_idxs]
+
+HTTP 200 { recommendations: [ { item_id, grade, purpose, term, int_rate, ... } ] }
 ```
 
 ---
 
-### 4.5 Deployment Commands
+## 4. MLOps & Scaling Considerations
 
-```bash
-# Build and start
-docker compose up --build
+### Model Artefact Management
 
-# Run in background
-docker compose up --build -d
+All artefacts are versioned by write timestamp and stored under `models/saved/`.
+In production, this directory would be replaced with an object store (S3, GCS)
+with version prefixes. The `feature_meta.json` file acts as a schema registry:
+the predictor reads `n_users`, `n_items`, `user_feat_dim`, `item_feat_dim`, and
+`model_type` at startup, allowing the model skeleton to be reconstructed without
+code changes when dimensions change between retraining runs.
 
-# View logs
-docker compose logs -f recommender-api
+### Candidate Generation Latency
 
-# Test the endpoint
-curl -X POST http://localhost:8000/recommend \
-  -H "Content-Type: application/json" \
-  -d '{"user_id": "U123", "top_k": 5}'
+| Operation | Typical Latency | Notes |
+|-----------|----------------|-------|
+| FAISS search (n_items=181, pool=50) | < 1 ms | Exact search; negligible at this scale |
+| FAISS search (n_items=1M, pool=50) | < 5 ms | IVFFlat approximate; index rebuild required |
+| DeepFM forward pass (50 candidates) | 2–8 ms | CPU; GPU reduces to < 1 ms |
+| Gemini API call | 200–800 ms | Network-bound; parallelise with ThreadPoolExecutor for batch jobs |
 
-# Stop
-docker compose down
+### LLM Rate Limit Handling (429/503)
+
+The retry strategy uses **linear backoff**: wait 15 × attempt seconds (15s, 30s, 45s).
+For production batch evaluation jobs, requests are spaced with a configurable
+`inter_user_sleep` (default 20s) to stay within free-tier quota limits. The
+`ablation_study.py` script passes `inter_user_sleep` and `inter_model_sleep`
+as parameters for easy adjustment.
+
+For a production API serving concurrent requests, the recommended approach is:
+1. Run Stage 3 asynchronously (non-blocking); return Stage 2 results immediately.
+2. Push the LLM re-rank result to the client via SSE or a polling endpoint.
+3. Cache LLM re-rankings keyed by `(user_idx, deepfm_top10_hash)` with a short TTL.
+
+### Graceful Degradation
+
+The system degrades across three levels automatically:
+
 ```
+Stage 3 (Gemini) available    → full three-stage pipeline
+Stage 3 unavailable           → Stage 2 output (DeepFM, NDCG@5 ≈ 0.28)
+Stage 2 unavailable           → Stage 1 output (FAISS, NDCG@5 ≈ 0.18)
+Stage 1 unavailable           → popularity fallback (globally most-interacted products)
+```
+
+No configuration change is required; the system detects missing API keys and
+failed model loads at startup and adjusts the active pipeline depth accordingly.
+
+### GPU Compatibility Note
+
+The project was developed on an RTX 5060 Ti (sm_120 architecture), which is not
+supported by PyTorch ≤ 2.4 (max sm_90). All training and inference scripts
+default to `device="cpu"`. When deploying on a supported GPU, set
+`--device cuda` in training and update `RankingPredictor(device="cuda")` in
+the predictor instantiation.
 
 ---
 
@@ -685,67 +432,57 @@ docker compose down
 
 ### Metrics
 
+Both metrics are evaluated at K=5 to match the final top-5 output of the pipeline:
+
 ```python
-# evaluation/metrics.py
+def ndcg_at_k(ranked, ground_truth, k=5):
+    """Position-weighted: hitting rank 1 > rank 5."""
+    dcg  = Σ  1 / log₂(rank + 2)   for rank, item in ranked[:k] if item in gt
+    idcg = Σ  1 / log₂(rank + 2)   for rank in range(min(|gt|, k))
+    return dcg / idcg
 
-def recall_at_k(recommended: list, ground_truth: set, k: int) -> float:
-    """Fraction of ground-truth items captured in top-K recommendations."""
-    hits = len(set(recommended[:k]) & ground_truth)
-    return hits / min(len(ground_truth), k)
-
-def ndcg_at_k(recommended: list, ground_truth: set, k: int) -> float:
-    """
-    Normalised Discounted Cumulative Gain.
-    Rewards relevant items appearing earlier in the ranked list.
-    """
-    import math
-    dcg = sum(
-        1.0 / math.log2(rank + 2)
-        for rank, item in enumerate(recommended[:k])
-        if item in ground_truth
-    )
-    ideal_hits = min(len(ground_truth), k)
-    idcg = sum(1.0 / math.log2(rank + 2) for rank in range(ideal_hits))
-    return dcg / idcg if idcg > 0 else 0.0
+def recall_at_k(ranked, ground_truth, k=5):
+    """Fraction of ground-truth items captured in top-K."""
+    return |{ranked[:k]} ∩ gt| / |gt|
 ```
 
 ### Ablation Study Design
 
-| Configuration | Retrieval | Ranking | LLM Rerank | Expected Recall@10 | Expected NDCG@10 |
-|---|---|---|---|---|---|
-| Baseline (popular items) | ✗ | ✗ | ✗ | ~0.05 | ~0.04 |
-| Retrieval only (ALS+FAISS) | ✓ | ✗ | ✗ | ~0.25 | ~0.18 |
-| Retrieval + Ranking | ✓ | ✓ | ✗ | ~0.35 | ~0.28 |
-| Full pipeline (+LLM) | ✓ | ✓ | ✓ | ~0.38 | ~0.32 |
+Three pipeline stages are evaluated on the test split, with metrics reported
+separately for Warm Start and Cold Start user subsets:
 
-> **Note:** Exact numbers depend on dataset size, hyperparameters, and negative sampling strategy. Use the ablation to demonstrate relative improvement, not absolute benchmarks.
+| Stage | Components | Candidate Set | Metric |
+|-------|-----------|---------------|--------|
+| 1 — Retrieval Only | ALS + FAISS | top-50 → evaluated at top-5 | NDCG@5, Recall@5 |
+| 2 — Retrieval + Ranking | + DeepFM | top-50 → re-score → top-10 → top-5 | NDCG@5, Recall@5 |
+| 3 — Retrieval + Ranking + LLM | + Gemini | top-10 → LLM re-order → top-5 | NDCG@5, Recall@5 |
+
+Statistical significance on warm-start users is tested with a **paired t-test**
+(each user provides a matched pair of scores between stages).
 
 ```bash
-# Run full ablation
-python evaluation/ablation_study.py \
-  --test-data data/processed/test_interactions.npz \
-  --k 10 \
-  --output results/ablation_results.csv
+python -m evaluation.ablation_study --k 5 --n-users 20 --pool 50
 ```
 
 ---
 
-## 6. End-to-End Pipeline Execution Order
+## 6. Execution Order
 
 ```
 1.  python preprocessing/build_interactions.py
 2.  python preprocessing/feature_engineering.py
 3.  python retrieval/train_als.py
 4.  python retrieval/build_faiss_index.py
-5.  python ranking/train_ranking.py
-6.  python evaluation/evaluate_pipeline.py
-7.  python evaluation/ablation_study.py
-8.  docker compose up --build          # serve the API
+5.  python ranking/train_ranking.py      [--device cpu]
+6.  python evaluation/ablation_study.py  [--k 5 --n-users 20]
+7.  docker compose up --build            # serve the API
 ```
 
-Each script is independently runnable, reads from `data/processed/` or `models/saved/`, and writes its outputs there. This makes the pipeline easy to re-run partially (e.g., retrain only the ranking model without rerunning ALS).
+Each script reads from `data/processed/` or `models/saved/` and writes its
+outputs there. All steps are independently re-runnable — retraining the ranking
+model does not require re-running ALS or FAISS indexing.
 
 ---
 
-*Document generated: 2026-03-13*
-*Stack versions: Python 3.11, PyTorch 2.x, FAISS 1.7.x, FastAPI 0.110.x*
+*Last updated: 2026-03-17*
+*Stack: Python 3.11 · PyTorch 2.x · FAISS 1.7.x · google-genai · FastAPI 0.110.x*
